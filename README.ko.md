@@ -10,7 +10,7 @@
 
 ### 텔레그램 알림 예시
 
-<img src="assets/person-detection.png" width="560" alt="감지된 사람을 초록색 박스로 표시한 텔레그램 알림. 영상에는 감지 전 5초와 감지 후 15초가 담깁니다.">
+<img src="assets/person-detection.jpg" width="560" alt="감지된 사람을 초록색 박스로 표시한 텔레그램 알림. 영상에는 감지 전 5초와 감지 후 15초가 담깁니다.">
 
 ## 준비물
 

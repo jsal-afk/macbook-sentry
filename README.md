@@ -10,7 +10,7 @@
 
 ### Telegram alert example
 
-<img src="assets/person-detection.png" width="560" alt="Telegram person detection alert with a green box around the detected person. The clip shows 5 seconds before and 15 seconds after detection.">
+<img src="assets/person-detection.jpg" width="560" alt="Telegram person detection alert with a green box around the detected person. The clip shows 5 seconds before and 15 seconds after detection.">
 
 ## What you need
 
