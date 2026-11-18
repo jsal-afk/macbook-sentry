@@ -8,6 +8,10 @@
 - **Person alerts in Telegram.** When Sentry detects someone, the bot you set up sends an alert and a clip with sound and boxes around detected people. The original recording stays unchanged.
 - **No live feed, cloud inference, or background AI agent.** Person detection runs on your Mac.
 
+### Telegram alert example
+
+<img src="assets/person-detection.png" width="560" alt="Telegram person detection alert with a green box around the detected person. The clip shows 5 seconds before and 15 seconds after detection.">
+
 ## What you need
 
 An Apple-silicon Mac running macOS 14 or newer, a compatible built-in or USB camera, and a microphone. Keep the Mac powered and awake. If you're using a MacBook's built-in camera, leave its lid open.
