@@ -34,9 +34,9 @@ Use an Apple-silicon Mac (macOS 14+) with a compatible built-in or USB camera an
 
    **Optional: save to an external drive.** While stopped, run `sentry archive '/Volumes/DRIVE_NAME'` with the actual mounted name. The drive must have a volume UUID; Sentry creates a new `Mac-Sentry` folder there. To switch back, run `sentry archive --internal --name archive-new`. When a folder name is already in use, pick a new one with `--name`. Changing storage doesn't move or delete existing footage. If an enrolled external drive is unavailable, Sentry doesn't switch to the internal disk.
 
-## 2. Optional person detection and private Telegram
+## 2. Person detection and Telegram alerts
 
-Without this section, no model packages or bot are required. From the same source directory:
+Install the local detection model and pair your Telegram bot to receive alerts and clips. From the same source directory:
 
 ```sh
 .venv/bin/python -m pip --isolated --disable-pip-version-check install --index-url https://pypi.org/simple -r requirements-detection.txt
@@ -57,7 +57,7 @@ sentry check-model
 
 This is the [RF-DETR 1.8.0 Nano COCO checkpoint](https://github.com/roboflow/rf-detr/blob/1.8.0/src/rfdetr/assets/model_weights.py); no runtime downloads. `check-model` runs on a generated blank image, with no camera. Create a **dedicated** bot in Telegram with BotFather (`/newbot`); don't add it to groups or connect another poller/webhook. On the Mac run `sentry pair-bot`. The **owner** enters the token at the hidden Terminal prompt, then sends the printed one-time `/start <code>` in the private chat with the exact `@bot` shown. Never share the token in chat, a command, a log, or the source directory. Sentry saves only one chat binding with the token in `~/.macbook-sentry/bot.json`, owner-only and link-checked. Polling ends at pairing; Bot API replies are checked directly on sends.
 
-Run `sentry test-bot` to receive text and an MP4 test pattern with a tone (no camera); check both in that one chat and play the video. Enable with `sentry configure --detection on`. To rotate a token, stop, revoke/regenerate in BotFather, repeat `pair-bot` and `test-bot`, then restart unarmed. A changed bot or recipient does not inherit queued deliveries. `sentry configure --detection off` returns to clean A/V only. Telegram copies have their own lifetime and aren't deleted by SSD retention.
+Run `sentry test-bot` to receive text and an MP4 test pattern with a tone (no camera); check both in that one chat and play the video. Enable detection with `sentry configure --detection on`. To rotate a token, stop, revoke/regenerate in BotFather, repeat `pair-bot` and `test-bot`, then restart unarmed. A changed bot or recipient does not inherit queued deliveries. `sentry configure --detection off` returns to clean A/V only. Local retention does not delete clips already sent to Telegram.
 
 ## 3. Optional iPhone automation (private Tailscale Serve only)
 
