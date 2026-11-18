@@ -3,6 +3,7 @@ from hmac import compare_digest, digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import re
+import threading
 from typing import cast
 
 from controller import event_time
@@ -17,11 +18,28 @@ def diagnostic_secret(secret):
 
 class Receiver(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 16
 
     def __init__(self, port, owner, secret, controller):
         self.owner, self.controller = owner, controller
         self.secrets = (secret, diagnostic_secret(secret)) if controller.test else (secret,)
+        self.slots = threading.BoundedSemaphore(16)
         super().__init__(('127.0.0.1', port), Handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            return self.shutdown_request(request)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
     def handle_error(self, request, client_address):
         pass  # No request metadata or tracebacks in logs.

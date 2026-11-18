@@ -76,6 +76,40 @@ class Candidate(unittest.TestCase):
         self.addCleanup(with_prefix.cleanup)
         self.base = Path(with_prefix.name).resolve()
 
+    def test_receiver_bounds_concurrent_connections_and_recovers(self):
+        test = controller.Controller({}, test=True)
+        sockets = []
+        with Receiver(0, OWNER, SECRET, test) as receiver:
+            self.assertEqual(receiver.server_address[0], '127.0.0.1')
+            endpoint = ('127.0.0.1', receiver.server_port)
+            thread = threading.Thread(target=receiver.serve_forever, kwargs={'poll_interval': .02})
+            thread.start()
+            try:
+                with patch.object(receiver, 'process_request_thread', wraps=receiver.process_request_thread) as handle:
+                    for _ in range(16):
+                        sockets.append(socket.create_connection(endpoint, timeout=1))
+                    until(lambda: handle.call_count == 16)
+                    with socket.create_connection(endpoint, timeout=1) as excess:
+                        try:
+                            self.assertEqual(excess.recv(1), b'')
+                        except ConnectionResetError:
+                            pass
+                    self.assertEqual(handle.call_count, 16)
+                sockets.pop().close()
+                def recovered():
+                    try:
+                        return post(receiver.server_port, '/home')[0] == 200
+                    except (OSError, ConnectionError):
+                        return False
+                until(recovered, seconds=2)
+                self.assertFalse(test.status()['capture_worker'])
+            finally:
+                for client in sockets:
+                    client.close()
+                receiver.shutdown()
+                thread.join()
+                test.close()
+
     def test_shortcut_serialization_and_replay_on_test_receiver(self):
         test = controller.Controller({}, test=True)
         with Receiver(0, OWNER, SECRET, test) as receiver:
