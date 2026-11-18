@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and operate MacBook Sentry from the Mac's local Terminal."""
+"""Install and operate Mac Sentry from the Mac's local Terminal."""
 import argparse
 from contextlib import ExitStack
 import json
@@ -48,8 +48,9 @@ def load(path):
     for key in ('ffmpeg', 'ffprobe', 'microphone_capture', 'person_weights'):
         if not isinstance(data.get(key), str) or not Path(data[key]).is_absolute():
             raise ValueError(f'Invalid {key}: expected absolute path')
-    archive_fields = {'volume', 'volume_uuid', 'archive_name', 'archive_owner'}
-    if archive_fields.intersection(data) and not all(isinstance(data.get(k), str) for k in archive_fields):
+    bound = archive.BINDING_FIELDS.intersection(data)
+    if bound and (bound not in ({'archive_name', 'archive_owner'}, archive.BINDING_FIELDS)
+                  or not all(isinstance(data[k], str) for k in bound)):
         raise ValueError('Incomplete archive binding')
     phone_fields = {'phone_owner', 'phone_host', 'phone_secret'}
     if phone_fields.intersection(data) and not (
@@ -76,17 +77,18 @@ def init(path):
         compiled.replace(mic)
     config = path/'config.json'
     if not config.exists() and not config.is_symlink():
-        state.write(config, dict(version=1, ffmpeg=ffmpeg, ffprobe=ffprobe, microphone_capture=str(mic),
-                                 person_weights=str(path/'rf-detr-nano.pth'), detection=False,
-                                 camera_input='0:none', person_confidence=.45, retention_hours=24,
-                                 away_lease_seconds=14400, listen_port=18765))
-    load(path)
+        data = dict(version=1, ffmpeg=ffmpeg, ffprobe=ffprobe, microphone_capture=str(mic),
+                    person_weights=str(path/'rf-detr-nano.pth'), detection=False,
+                    camera_input='0:none', person_confidence=.45, retention_hours=24,
+                    away_lease_seconds=14400, listen_port=18765)
+    else:
+        data = load(path)
+    if 'archive_owner' not in data:
+        state.write(config, data | archive.provision_internal())
     print('Initialized without starting Sentry:', path)
 
 
 def preflight(path, config):
-    if not config.get('volume'):
-        raise RuntimeError('Enroll the selected SSD first with archive')
     with archive.open_archive(config) as root:
         from sentry import check_space
         check_space(root)
@@ -259,8 +261,10 @@ def main(argv=None):
         commands.add_parser(command)
     commands.add_parser('run').add_argument('--test', action='store_true', help='Never arms, records, or removes media')
     disk = commands.add_parser('archive')
-    disk.add_argument('mount', type=Path)
-    disk.add_argument('--name', default='MacBook-Sentry')
+    target = disk.add_mutually_exclusive_group(required=True)
+    target.add_argument('mount', type=Path, nargs='?', help='Mounted external drive')
+    target.add_argument('--internal', action='store_true', help='New archive on the Mac')
+    disk.add_argument('--name', help='New archive directory name')
     configure = commands.add_parser('configure')
     configure.add_argument('--retention-hours', type=float)
     configure.add_argument('--away-lease-seconds', type=int)
@@ -309,9 +313,10 @@ def main(argv=None):
                 state.write(config_file, config)
                 print('Settings saved; service remains stopped')
             elif args.command == 'archive':
-                config.update(archive.provision(args.mount, args.name))
-                state.write(config_file, config)
-                print('New owned archive created on the selected SSD')
+                binding = (archive.provision_internal(args.name or archive.INTERNAL_NAME) if args.internal
+                           else archive.provision(args.mount, args.name or archive.EXTERNAL_NAME))
+                state.write(config_file, {k: v for k, v in config.items() if k not in archive.BINDING_FIELDS} | binding)
+                print('New recording archive created:', (path if args.internal else args.mount)/binding['archive_name'])
             elif args.command == 'run':
                 serve(path, config, lock, args.test)
             elif args.command == 'pair-bot':

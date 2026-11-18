@@ -166,11 +166,11 @@ class Controller:
 
     def retain(self):
         while not self.retention_stop.is_set():
-            if self.config.get('volume'):
+            if self.config.get('archive_owner'):
                 try:
                     archive.sweep(self.config)
                 except FileNotFoundError:
-                    pass  # No internal fallback.
+                    pass  # Never fall back to another archive.
                 except (OSError, ValueError) as exc:
                     print('archive_retention:', type(exc).__name__, file=sys.stderr, flush=True)
             self.retention_stop.wait(SWEEP_SECONDS)

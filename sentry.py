@@ -331,14 +331,12 @@ def worker(config, session, state_dir):
     threading.Thread(target=parent_lost, daemon=True).start()
     if stop.is_set() or remaining() <= 0:
         return
-    if not config.get('volume'):
-        raise OSError('No recording volume enrolled')
     with archive.open_archive(config) as root:
         check_space(root)
         for name in ('recordings', 'events'):
             with archive.child(root, name):
                 pass
-        os.fchdir(root)  # Relative output never falls back to the boot disk after eject.
+        os.fchdir(root)  # Relative output stays bound to the selected archive.
     if frames is not None:
         from state import read
         from telegram_bot import validate_binding

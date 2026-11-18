@@ -178,7 +178,7 @@ time.sleep(35)
                     self.assertEqual(post(receiver.server_port, '/away', headers)[0], 403)
                     self.assertFalse(service.status()['last_accepted'])
                     self.assertEqual(post(receiver.server_port, '/away')[0], 200)
-                    # Real worker, but no SSD configuration: exits before opening any device.
+                    # Real worker, but no archive binding: exits before opening any device.
                     until(lambda: service.status()['error'] == 'capture_worker_exited')
                     self.assertFalse(service.status()['capture_worker'])
                     self.assertFalse(service.status()['armed'])
@@ -236,6 +236,17 @@ time.sleep(35)
                 service.close()
         with self.assertRaises((FileNotFoundError, ValueError)):
             archive.sweep(config)
+
+    def test_external_hard_drive_identity(self):
+        mount = Path('/Volumes/Test-Drive')
+        identifier = 'deadbeef-dead-4bee-8fee-deadbeefdead'
+        info = {'MountPoint': str(mount), 'VolumeUUID': identifier, 'Internal': False,
+                'SolidState': False, 'BusProtocol': 'USB'}
+        with patch.object(archive.subprocess, 'check_output', return_value=plistlib.dumps(info)):
+            self.assertEqual(archive.disk_identity(mount), identifier)
+        with patch.object(archive.subprocess, 'check_output',
+                          return_value=plistlib.dumps(info | {'Internal': True})), self.assertRaises(OSError):
+            archive.disk_identity(mount)
 
     def test_pair_challenge_and_outbound_validation(self):
         notice = []
@@ -311,10 +322,21 @@ time.sleep(35)
         path = self.base/'.macbook-sentry'
         self.assertEqual((path.stat().st_mode & 0o777, (path/'config.json').stat().st_mode & 0o777), (0o700, 0o600))
         self.assertFalse((path/'control.sock').exists())
+        config = state.read(path/'config.json')
+        self.assertNotIn('volume', config)
+        archive_path = path/'archive'
+        self.assertEqual((archive_path/archive.MARKER).read_text().strip(), config['archive_owner'])
+        self.assertEqual(config['retention_hours'], 24)
         call('configure', '--retention-hours', '12', '--away-lease-seconds', '30', '--person-confidence', '.55',
-             '--detection', 'off', '--camera', 'Built-in Camera')
+             '--detection', 'off', '--camera', 'USB Webcam')
         call('configure', '--retention-hours', '0', status=1)
         call('archive', str(self.base/'not-a-volume'), status=1)
+        recording = archive_path/'recordings'/('a'*32)
+        recording.mkdir()
+        now = int(time.time())
+        expired, kept = (recording/f'{now-hours*3600}.ts' for hours in (13, 11))
+        for item in (expired, kept):
+            item.write_bytes(b'fixture')
         with socket.socket() as reservation:
             reservation.bind(('127.0.0.1', 0))
             port = reservation.getsockname()[1]
@@ -330,10 +352,17 @@ time.sleep(35)
                     result = json.loads(call('status'))
                     self.assertEqual((result['mode'], result['armed'], result['signal']), ('test' if test else 'run', False, None))
                     call('run', status=1)
-                    call('arm', status=1)  # Test cannot arm; normal cannot arm without a volume.
-                    call('home')
-                    self.assertEqual(json.loads(call('status'))['signal'], 'home')
                     call('away', status=0 if test else 1)
+                    call('arm', status=1 if test else 0)
+                    call('home')
+                    result = json.loads(call('status'))
+                    self.assertEqual(result['signal'], 'home')
+                    self.assertFalse(result['capture_worker'])
+                    if test:
+                        self.assertTrue(expired.exists())
+                    else:
+                        until(lambda: not expired.exists())
+                    self.assertTrue(kept.exists())
                     self.assertFalse(json.loads(call('pause'))['capture_worker'])
                     self.assertEqual(json.loads(call('stop'))['mode'], 'stopped')
                     self.assertEqual(service.wait(timeout=6), 0)
@@ -342,6 +371,21 @@ time.sleep(35)
                         service.kill()
         self.assertEqual(json.loads(call('stop'))['mode'], 'stopped')
         self.assertFalse((path/'control.sock').exists())
+        config = state.read(path/'config.json')
+        external = config | {'volume': '/Volumes/SentryTestNotMounted', 'volume_uuid': '9'*32}
+        with patch.dict(os.environ, HOME=str(self.base)), self.assertRaises(PermissionError):
+            archive.sweep(config | {'archive_owner': '0'*32})
+        with self.assertRaises(FileNotFoundError), archive.open_archive(external):
+            self.fail('An unavailable external archive must not fall back to internal storage')
+        state.write(path/'config.json', external)
+        call('archive', '--internal', status=1)  # Never adopt the existing archive.
+        self.assertEqual(state.read(path/'config.json'), external)
+        call('archive', '--internal', '--name', 'recordings-new')
+        config = state.read(path/'config.json')
+        self.assertFalse({'volume', 'volume_uuid'}.intersection(config))
+        self.assertEqual(config['retention_hours'], 12)
+        self.assertTrue(kept.exists())  # Switching never moves or deletes footage.
+        self.assertTrue((path/'recordings-new'/'recordings').is_dir())
 
     def test_cli_pair_rotation_sign_and_video_without_external_calls(self):
         with patch.dict(os.environ, HOME=str(self.base)), cwd(self.base), redirect_stdout(io.StringIO()):

@@ -12,12 +12,17 @@ import subprocess
 import time
 import uuid
 
+import state
+
 NS = 1_000_000_000
 DAY = 86_400 * NS
 SEGMENT_SECONDS = 10
 MARKER = '.sentry-archive-v1'
 DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+BINDING_FIELDS = {'volume', 'volume_uuid', 'archive_name', 'archive_owner'}
+INTERNAL_NAME = 'archive'
+EXTERNAL_NAME = 'Mac-Sentry'
 SESSION = re.compile(r'[0-9a-f]{32}')
 SEGMENT = re.compile(r'[1-9][0-9]{8,10}\.ts')
 EVENT = re.compile(r'([1-9][0-9]{17,19})-([0-9a-f]{32})')
@@ -30,11 +35,11 @@ def disk_identity(mount):
         data = plistlib.loads(subprocess.check_output(
             ['/usr/sbin/diskutil', 'info', '-plist', str(mount)], stderr=subprocess.DEVNULL, timeout=3))
         if (data.get('MountPoint') != str(mount) or data.get('Internal') is not False
-                or data.get('SolidState') is not True or data.get('BusProtocol') == 'Disk Image'):
+                or data.get('BusProtocol') == 'Disk Image'):
             raise ValueError
         return str(uuid.UUID(data['VolumeUUID']))
     except (subprocess.SubprocessError, KeyError, TypeError, ValueError, plistlib.InvalidFileException) as exc:
-        raise OSError('Select a mounted external SSD with a volume UUID') from exc
+        raise OSError('Select a mounted external drive with a volume UUID') from exc
 
 
 @contextmanager
@@ -53,21 +58,42 @@ def open_volume(mount, *, is_mount=os.path.ismount):
         os.close(volume)
 
 
-def provision(mount, name):
+def create_owned(parent, name):
     validate_name(name)
     owner = uuid.uuid4().hex
+    os.mkdir(name, mode=0o700, dir_fd=parent)  # Never adopt an existing name.
+    with child(parent, name) as root:
+        for folder in ('recordings', 'events'):
+            os.mkdir(folder, mode=0o700, dir_fd=root)
+        with os.fdopen(os.open(MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                              0o600, dir_fd=root), 'w') as marker:
+            marker.write(owner + '\n')
+    return {'archive_name': name, 'archive_owner': owner}
+
+
+@contextmanager
+def open_internal():
+    fd = os.open(state.directory(), DIR)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise PermissionError('Internal archive parent must be owner-only')
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def provision_internal(name=INTERNAL_NAME):
+    with open_internal() as parent:
+        return create_owned(parent, name)
+
+
+def provision(mount, name):
     with open_volume(mount) as volume:
         identity = disk_identity(mount)
         if not os.path.samestat(os.fstat(volume), mount.stat()):
             raise FileNotFoundError('Selected volume changed')
-        os.mkdir(name, mode=0o700, dir_fd=volume)  # Never adopt an existing name.
-        with child(volume, name) as root:
-            os.mkdir('recordings', mode=0o700, dir_fd=root)
-            os.mkdir('events', mode=0o700, dir_fd=root)
-            with os.fdopen(os.open(MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                  0o600, dir_fd=root), 'w') as marker:
-                marker.write(owner + '\n')
-    return {'volume': str(mount), 'volume_uuid': identity, 'archive_name': name, 'archive_owner': owner}
+        return create_owned(volume, name) | {'volume': str(mount), 'volume_uuid': identity}
 
 
 def validate_name(name):
@@ -77,16 +103,22 @@ def validate_name(name):
 
 @contextmanager
 def open_archive(config, *, check_identity=True):
-    mount = Path(config['volume'])
-    name, owner = config['archive_name'], config['archive_owner']
+    if not BINDING_FIELDS.intersection(config):
+        raise FileNotFoundError('No recording archive configured')
+    name, owner = config.get('archive_name'), config.get('archive_owner')
+    external = 'volume' in config or 'volume_uuid' in config
+    required = BINDING_FIELDS if external else {'archive_name', 'archive_owner'}
+    if not all(isinstance(config.get(key), str) for key in required):
+        raise ValueError('Incomplete archive binding')
     validate_name(name)
     if not re.fullmatch(r'[0-9a-f]{32}', owner):
         raise ValueError('Invalid archive owner')
-    with open_volume(mount) as volume:
-        if check_identity and (disk_identity(mount) != config['volume_uuid']
-                               or not os.path.samestat(os.fstat(volume), mount.stat())):
+    mount = Path(config['volume']) if external else None
+    with (open_volume(mount) if mount is not None else open_internal()) as parent:
+        if mount is not None and check_identity and (disk_identity(mount) != config['volume_uuid']
+                                                    or not os.path.samestat(os.fstat(parent), mount.stat())):
             raise PermissionError('Wrong recording volume UUID')
-        with child(volume, name) as root:
+        with child(parent, name) as root:
             with read_file(root, MARKER) as marker:
                 if marker.read(64).strip() != owner:
                     raise PermissionError('Sentry archive ownership marker mismatch')
