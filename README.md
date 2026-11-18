@@ -1,5 +1,7 @@
 # Mac Sentry
 
+[한국어](README.ko.md) · [한국어 설치 가이드](INSTALL.ko.md)
+
 **Leave home and your Mac starts recording. Come back and it stops.** Once set up and armed, Mac Sentry follows your iPhone's departure and arrival automations. Use a built-in camera or a webcam on a Mac mini.
 
 - **Local recordings.** Video and sound are saved on the Mac by default. You can use an external drive instead. Recordings are kept for 24 hours from capture by default, and you can change the duration.

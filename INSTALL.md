@@ -1,5 +1,7 @@
 # Install and operate Mac Sentry
 
+[한국어](INSTALL.ko.md)
+
 Use an Apple-silicon Mac (macOS 14+) with a compatible built-in or USB camera and a microphone. Run these commands in Terminal as the logged-in user, not as root. Setup does not start capture or add a login item.
 
 ## 1. Install unarmed
