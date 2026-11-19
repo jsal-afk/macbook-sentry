@@ -77,6 +77,53 @@ class Candidate(unittest.TestCase):
         self.addCleanup(with_prefix.cleanup)
         self.base = Path(with_prefix.name).resolve()
 
+    def test_detector_keeps_initial_frames_while_model_loads(self):
+        frames = sentry.Frames()
+        with patch.object(sentry, 'FRAME_BYTES', 1):
+            frames.read(io.BytesIO(b'1234567'), 'a'*32)
+        frames.model_ready()
+        for expected in b'1234567':
+            frame = frames.next(0)
+            assert frame is not None
+            self.assertEqual(frame[3], bytes([expected]))
+        self.assertEqual(frames.queue.maxlen, sentry.LIVE_FRAMES)
+
+    def test_closed_clip_resumes_without_resending_alert_or_touching_active_capture(self):
+        config = {'retention_hours': 24}
+        binding = {'generation': 'fixture'}
+        active = ['a'*32]
+        generation = binding['generation']
+        (self.base/'events').mkdir()
+        active_dir, done, old = (self.base/'events'/f'{time.time_ns()}-{i*32}' for i in 'abc')
+        for path, session, gen in ((active_dir, active[0], generation), (done, 'b'*32, generation),
+                                   (old, 'c'*32, 'old-bot')):
+            path.mkdir()
+            sentry.atomic(path/'event.json', {'capture': session, 'delivery_generation': gen,
+                                             'time': sentry.timestamp(), 'clip_ready': False})
+            sentry.atomic(path/'receipt.json', {'alert': {'message_id': 9}})
+
+        def annotate(source, part):
+            self.assertEqual(source.parent, done)
+            part.write_bytes(b'boxed mp4 fixture')
+
+        stop = threading.Event()
+        with (patch('person_detector.PersonModel') as model, patch.object(sentry, 'probe'),
+              patch.object(sentry, 'clip_event', return_value=time.time_ns()) as build,
+              patch.object(bot, 'send', return_value={'message_id': 10}) as send):
+            model.return_value.annotate.side_effect = annotate
+            for _ in range(2):
+                self.assertFalse(sentry.finish_closed_events(config, binding, self.base, lambda: active[0], stop))
+            build.assert_called_once()
+            self.assertTrue(build.call_args.kwargs['final'])
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args[2], done/'telegram.mp4')
+        self.assertEqual(json.loads((done/'receipt.json').read_text()),
+                         {'alert': {'message_id': 9}, 'video': {'message_id': 10}})
+        for untouched in (active_dir, old):
+            event = sentry.read_event(untouched)
+            assert event is not None
+            self.assertFalse(event['clip_ready'])
+
     def test_private_viewer_cannot_read_history_and_closes_on_home(self):
         with patch.dict(os.environ, HOME=str(self.base)), cwd(self.base):
             state.directory(create=True)

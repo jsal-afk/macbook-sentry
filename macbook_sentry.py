@@ -81,7 +81,8 @@ def init(path):
         subprocess.run(['/usr/bin/swiftc', '-O', '-module-cache-path', tmp,
                         '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist',
                         '-Xlinker', str(ROOT/'MicrophoneInfo.plist'),
-                        str(ROOT/'MicrophoneCapture.swift'), '-o', str(compiled)], check=True)
+                        str(ROOT/'PCMTimeline.swift'), str(ROOT/'MicrophoneCapture.swift'),
+                        '-o', str(compiled)], check=True)
         compiled.chmod(0o700)
         compiled.replace(mic)
     config = path/'config.json'
@@ -156,9 +157,37 @@ def status_notifier(path, test):
     return enqueue
 
 
+def finalize_recordings(path, config, active_session, wake, stopped):
+    from sentry import finish_closed_events
+
+    while not stopped.is_set():
+        wake.clear()
+        retry = False
+        try:
+            binding = telegram_bot.validate_binding(state.read(path/'bot.json'))
+            root = Path(config.get('volume', path))/config['archive_name']
+            with archive.open_archive(config) as fd, archive.child(fd, 'events') as events:
+                if (root.is_symlink() or not os.path.samestat(os.fstat(fd), root.stat())
+                        or not os.path.samestat(os.fstat(events), (root/'events').lstat())):
+                    raise PermissionError('Recording archive changed')
+                retry = finish_closed_events(config, binding, root, active_session, stopped)
+        except (KeyError, OSError, ValueError) as exc:
+            retry = True
+            if not isinstance(exc, FileNotFoundError):
+                print('Pending clips could not be checked:', type(exc).__name__, flush=True)
+        wake.wait(60 if retry else None)
+
+
 def serve(path, config, lock, test):
-    controller = Controller(config, lock, test=test, notice=status_notifier(path, test))
+    finalize = not test and config['detection']
+    clip_wake = threading.Event()
+    controller = Controller(config, lock, test=test, notice=status_notifier(path, test),
+                            capture_closed=clip_wake.set if finalize else None)
     stopped = threading.Event()
+    if finalize:
+        threading.Thread(target=finalize_recordings,
+                         args=(path, config, controller.owning_session, clip_wake, stopped),
+                         name='pending-clips', daemon=True).start()
 
     def dispatch(command):
         error = None
@@ -210,6 +239,8 @@ def serve(path, config, lock, test):
             stopped.wait()
             controller.pause()
     finally:
+        stopped.set()
+        clip_wake.set()
         controller.close()
 
 

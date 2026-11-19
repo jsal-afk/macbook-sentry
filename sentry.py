@@ -19,6 +19,7 @@ import archive
 
 WIDTH, HEIGHT, DETECT_FPS = 960, 540, 2
 FRAME_BYTES = WIDTH * HEIGHT * 3
+STARTUP_FRAMES, LIVE_FRAMES = 90 * DETECT_FPS, 3
 FREE_BYTES = 5 * 1024**3
 AAC = ['-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '96k', '-ar', '48000', '-ac', '1']
 VT = ['-c:v', 'h264_videotoolbox', '-realtime', '1', '-allow_sw', '0']
@@ -38,7 +39,8 @@ def log(kind, **kw):
     print(json.dumps({'time': timestamp(), 'kind': kind, **kw}, ensure_ascii=False), flush=True)
 
 
-def camera_command(config, directory, duration, audio_fd=None, *, audio_rate=48000, source=None):
+def camera_command(config, directory, duration, audio_fd=None, *, audio_rate=48000, source=None,
+                   command_stdin=False):
     """The generated-media source is for offline tests, not a worker CLI option."""
     inp = (['-re', '-i', str(source)] if source else
            ['-thread_queue_size', '16', '-f', 'avfoundation', '-pixel_format', 'nv12',
@@ -55,11 +57,13 @@ def camera_command(config, directory, duration, audio_fd=None, *, audio_rate=480
         graph += '[rec];'
     graph += audio + '[arec]'
     limit = ['-t', str(duration)]
-    cmd = [config['ffmpeg'], '-hide_banner', '-loglevel', 'warning', '-nostdin', '-y', *inp,
+    cmd = [config['ffmpeg'], '-hide_banner', '-loglevel', 'warning',
+           '-stdin' if command_stdin else '-nostdin', '-y', *inp,
            '-filter_complex_threads', '1', '-filter_complex', graph,
            '-map', '[rec]', '-map', '[arec]', *limit, *AAC, *VT, '-pix_fmt', 'nv12',
            '-b:v', '1500k', '-maxrate', '1800k', '-bufsize', '3600k', '-g', '30', '-color_range', 'tv',
            '-f', 'segment', '-segment_time', str(archive.SEGMENT_SECONDS), '-segment_format', 'mpegts',
+           '-segment_format_options', 'flush_packets=1',
            '-reset_timestamps', '1', '-segment_list', str(directory/'segments.csv'),
            '-segment_list_type', 'csv', '-strftime', '1', str(directory/'%s.ts')]
     if detection:
@@ -70,9 +74,17 @@ def camera_command(config, directory, duration, audio_fd=None, *, audio_rate=480
 
 class Frames:
     def __init__(self):
-        self.queue = deque(maxlen=3)
+        self.queue = deque(maxlen=STARTUP_FRAMES)
         self.cv = threading.Condition()
         self.last = 0
+        self.ready = False
+        self.failed = False
+
+    def model_ready(self, *, failed=False):
+        with self.cv:
+            self.ready, self.failed = True, failed
+            if failed:
+                self.queue.clear()
 
     def read(self, pipe, capture):
         start = 0
@@ -84,13 +96,16 @@ class Frames:
                 if index == 0:
                     start = time.time_ns()
                 with self.cv:
-                    self.queue.append((capture, index / DETECT_FPS,
-                                       start + index * (archive.NS // DETECT_FPS), frame))
+                    if not self.failed:
+                        self.queue.append((capture, index / DETECT_FPS,
+                                           start + index * (archive.NS // DETECT_FPS), frame))
                     self.last = time.monotonic()
                     self.cv.notify()
 
     def next(self, timeout):
         with self.cv:
+            if self.ready and len(self.queue) <= LIVE_FRAMES and self.queue.maxlen != LIVE_FRAMES:
+                self.queue = deque(self.queue, maxlen=LIVE_FRAMES)
             if not self.queue:
                 self.cv.wait(timeout)
             return self.queue.popleft() if self.queue else None
@@ -103,8 +118,8 @@ def read_event(directory):
         return None
 
 
-def event_dirs():
-    return (p for p in Path('events').iterdir() if archive.EVENT.fullmatch(p.name) and not p.is_symlink())
+def event_dirs(root=Path('.')):
+    return (p for p in (root/'events').iterdir() if archive.EVENT.fullmatch(p.name) and not p.is_symlink() and p.is_dir())
 
 
 def probe(config, path):
@@ -120,8 +135,9 @@ def clip_event(config, directory, event, *, final=False):
     capture = event['capture']
     if not archive.SESSION.fullmatch(capture):
         raise ValueError('Invalid capture identity')
-    recording = Path('recordings')/capture
-    if recording.is_symlink() or (recording/'segments.csv').is_symlink():
+    recordings = directory.parent.parent/'recordings'
+    recording = recordings/capture
+    if recordings.is_symlink() or recording.is_symlink() or (recording/'segments.csv').is_symlink():
         raise ValueError('Unexpected link in recording')
     try:
         with (recording/'segments.csv').open() as manifest:
@@ -168,8 +184,26 @@ def clip_event(config, directory, event, *, final=False):
         manifest.unlink(missing_ok=True)
 
 
-def delivery_worker(config, binding, stop, wake):
+def deliver_event(config, binding, directory, event, stop):
     from telegram_bot import send
+    receipt_path = directory/'receipt.json'
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except FileNotFoundError:
+        receipt = {}
+    text = f"Person detected · {dt.datetime.fromisoformat(event['time']):%m/%d %H:%M:%S}"
+    if not receipt.get('alert') and not stop.is_set():
+        receipt['alert'] = send(binding, text)
+        atomic(receipt_path, receipt)
+    if (event.get('clip_ready') and not receipt.get('video') and not stop.is_set()
+            and archive.event_end_ns(directory.name, event) > time.time_ns() - archive.retention_ns(config)):
+        video = directory/'telegram.mp4'
+        receipt['video'] = send(binding, text, video)
+        atomic(receipt_path, receipt)
+        video.unlink(missing_ok=True)
+
+
+def delivery_worker(config, binding, stop, wake, session):
     retry = {}
     wake.set()
     while not stop.is_set():
@@ -178,27 +212,13 @@ def delivery_worker(config, binding, stop, wake):
             if stop.is_set():
                 return
             event = read_event(directory)
-            if not event or event.get('delivery_generation') != binding['generation'] or archive.event_end_ns(directory.name, event) <= time.time_ns() - archive.retention_ns(config):
+            if not event or event.get('capture') != session or event.get('delivery_generation') != binding['generation'] or archive.event_end_ns(directory.name, event) <= time.time_ns() - archive.retention_ns(config):
                 retry.pop(directory, None)
                 continue
             try:
-                receipt_path = directory/'receipt.json'
-                try:
-                    receipt = json.loads(receipt_path.read_text())
-                except FileNotFoundError:
-                    receipt = {}
                 if time.monotonic() < retry.get(directory, 0):
                     continue
-                text = f"Person detected · {dt.datetime.fromisoformat(event['time']):%m/%d %H:%M:%S}"
-                if not receipt.get('alert') and not stop.is_set():
-                    receipt['alert'] = send(binding, text)
-                    atomic(receipt_path, receipt)
-                if (event.get('clip_ready') and not receipt.get('video') and not stop.is_set()
-                        and archive.event_end_ns(directory.name, event) > time.time_ns() - archive.retention_ns(config)):
-                    video = directory/'telegram.mp4'
-                    receipt['video'] = send(binding, text, video)
-                    atomic(receipt_path, receipt)
-                    video.unlink(missing_ok=True)
+                deliver_event(config, binding, directory, event, stop)
                 retry.pop(directory, None)
             except Exception as exc:
                 log('delivery_retry', error_type=type(exc).__name__)
@@ -208,10 +228,56 @@ def delivery_worker(config, binding, stop, wake):
         wake.wait(delay)
 
 
-def detect(config, frames, stop, wake, active, generation):
+def finish_clip(config, model, directory, event, stop, *, final=False):
+    capture_end = event.get('capture_end_ns') or clip_event(config, directory, event, final=final)
+    if not capture_end or stop.is_set():
+        return False
+    event['capture_end_ns'] = capture_end
+    atomic(directory/'event.json', event)
+    part = directory/'telegram.part.mp4'
+    model.annotate(directory/'clean.mp4', part)
+    probe(config, part)
+    if stop.is_set() or capture_end <= time.time_ns() - archive.retention_ns(config):
+        part.unlink(missing_ok=True)
+        return False
+    part.replace(directory/'telegram.mp4')
+    event['clip_ready'] = True
+    atomic(directory/'event.json', event)
+    return True
+
+
+def finish_closed_events(config, binding, root, active_session, stop):
+    from person_detector import PersonModel
+    model = None
+    retry = False
+    for directory in sorted(event_dirs(root)):
+        if stop.is_set():
+            break
+        try:
+            if any((directory/name).is_symlink() for name in archive.EVENT_FILES):
+                continue
+            event = read_event(directory)
+            if (not isinstance(event, dict) or not isinstance(event.get('capture'), str)
+                    or not archive.SESSION.fullmatch(event['capture']) or event['capture'] == active_session()
+                    or event.get('delivery_generation') != binding['generation']
+                    or archive.event_end_ns(directory.name, event) <= time.time_ns() - archive.retention_ns(config)):
+                continue
+            if not event.get('clip_ready'):
+                if model is None:
+                    model = PersonModel(config)
+                finish_clip(config, model, directory, event, stop, final=True)
+            deliver_event(config, binding, directory, event, stop)
+        except Exception as exc:
+            log('closed_event_retry', error_type=type(exc).__name__)
+            retry = True
+    return retry
+
+
+def detect(config, frames, stop, wake, generation):
     from person_detector import PersonGate, PersonModel
     model = PersonModel(config)
-    pending = {p: e for p in event_dirs() if (e := read_event(p)) and e.get('delivery_generation') == generation and not e.get('clip_ready')}
+    frames.model_ready()
+    pending = {}
     gate = PersonGate()
     last_capture = None
     next_clip = 0
@@ -244,20 +310,7 @@ def detect(config, frames, stop, wake, active, generation):
                 del pending[directory]
                 continue
             try:
-                capture_end = event.get('capture_end_ns') or clip_event(
-                    config, directory, event, final=active[0] != event['capture'])
-                if capture_end and not stop.is_set():
-                    event['capture_end_ns'] = capture_end
-                    atomic(directory/'event.json', event)
-                    part = directory/'telegram.part.mp4'
-                    model.annotate(directory/'clean.mp4', part)
-                    probe(config, part)
-                    if stop.is_set() or capture_end <= time.time_ns() - archive.retention_ns(config):
-                        part.unlink(missing_ok=True)
-                        continue
-                    part.replace(directory/'telegram.mp4')
-                    event['clip_ready'] = True
-                    atomic(directory/'event.json', event)
+                if finish_clip(config, model, directory, event, stop):
                     del pending[directory]
                     wake.set()
             except (OSError, ValueError, subprocess.SubprocessError, RuntimeError) as exc:
@@ -265,7 +318,7 @@ def detect(config, frames, stop, wake, active, generation):
                 del pending[directory]
 
 
-def finish(proc, timeout=1):
+def finish(proc, timeout: float = 1):
     if proc is None:
         return
     if proc.poll() is None:
@@ -275,6 +328,21 @@ def finish(proc, timeout=1):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def finish_capture(proc):
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.stdin.write(b'q\n')
+            proc.stdin.flush()
+            proc.wait(timeout=1.5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        finish(proc, .4)
+        proc.stdin.close()
 
 
 def check_space(path):
@@ -313,14 +381,13 @@ def worker(config, session, state_dir):
     stop = threading.Event()
     wake = threading.Event()
     frames = Frames() if config['detection'] else None
-    active = [None]
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
 
     def parent_lost():
         os.read(0, 1)
         stop.set()
-        os.killpg(os.getpgrp(), signal.SIGTERM)
         # If the parent disappeared, it cannot enforce the group grace period.
         time.sleep(3)
         os.killpg(os.getpgrp(), signal.SIGKILL)
@@ -341,13 +408,14 @@ def worker(config, session, state_dir):
         from state import read
         from telegram_bot import validate_binding
         binding = validate_binding(read(state_dir/'bot.json'))
-        threading.Thread(target=delivery_worker, args=(config, binding, stop, wake), daemon=True).start()
+        threading.Thread(target=delivery_worker, args=(config, binding, stop, wake, session), daemon=True).start()
 
         def detection():
             try:
-                detect(config, frames, stop, wake, active, binding['generation'])
+                detect(config, frames, stop, wake, binding['generation'])
             except Exception as exc:
                 # A model failure must not interrupt clean recording.
+                frames.model_ready(failed=True)
                 log('person_worker_failed', error_type=type(exc).__name__)
 
         threading.Thread(target=detection, daemon=True).start()
@@ -358,7 +426,7 @@ def worker(config, session, state_dir):
         capture = session
         directory = Path('recordings')/capture
         directory.mkdir()
-        active[0] = capture
+
         mic = camera = None
         try:
             mic = subprocess.Popen([config['microphone_capture'], str(max(0, remaining()) + 5)],
@@ -368,7 +436,8 @@ def worker(config, session, state_dir):
             rate = microphone_rate(fd)
             if stop.is_set() or remaining() <= 0:
                 return
-            camera = subprocess.Popen(camera_command(config, directory, remaining(), fd, audio_rate=rate),
+            camera = subprocess.Popen(camera_command(config, directory, remaining(), fd, audio_rate=rate,
+                                                         command_stdin=True), stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE if frames is not None else subprocess.DEVNULL,
                                       pass_fds=(fd,))
             mic.stdout.close()
@@ -392,8 +461,8 @@ def worker(config, session, state_dir):
             if not stop.is_set() and remaining() > 1:
                 raise OSError('Camera or microphone stopped early; check permissions and devices')
         finally:
-            finish(camera, 1.5)
-            finish(mic)
+            finish_capture(camera)
+            finish(mic, .4)
             if mic and mic.stdout:
                 mic.stdout.close()
             # A failed start can leave an empty directory; never remove media.
@@ -401,7 +470,7 @@ def worker(config, session, state_dir):
                 directory.rmdir()
             except OSError:
                 pass
-            active[0] = None
+
     finally:
         stop.set()
         wake.set()

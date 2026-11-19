@@ -32,9 +32,10 @@ def iso(epoch):
 
 
 class Controller:
-    def __init__(self, config, lock=None, *, test=False, notice=None):
+    def __init__(self, config, lock=None, *, test=False, notice=None, capture_closed=None):
         self.config, self.lock, self.test = config, lock, test
         self.notice = None if test else notice
+        self.capture_closed = None if test else capture_closed
         self.last_notice = None
         self.cv = threading.Condition()
         self.armed = False
@@ -62,6 +63,10 @@ class Controller:
                     'stopping_capture': self.stop_by is not None, 'error': self.error,
                     'lease_until': iso(self.away_wall_until) if self.away_wall_until else None,
                     'last_accepted': {name: iso(at) for name, at in self.last.items()}}
+
+    def owning_session(self):
+        with self.cv:
+            return self.session
 
     def viewing_session(self):
         with self.cv:
@@ -119,7 +124,11 @@ class Controller:
         self.away_until = self.away_wall_until = 0
         if self.worker and self.stop_by is None:
             self.stop_by = now + STOP_GRACE
-            self.kill_group(signal.SIGTERM)
+            # Let the worker close the muxer while its microphone is still alive.
+            try:
+                self.worker.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
     def kill_group(self, sig):
         try:
@@ -139,6 +148,8 @@ class Controller:
                     self.disarm(None, now)
                 self.worker = self.stop_by = None
                 self.session = None
+                if self.capture_closed is not None:
+                    self.capture_closed()
             elif self.stop_by is not None:
                 if now >= self.stop_by:
                     self.kill_group(signal.SIGKILL)
