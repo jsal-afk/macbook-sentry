@@ -355,7 +355,7 @@ def worker(config, session, state_dir):
         return
     awake = subprocess.Popen(['/usr/bin/caffeinate', '-i', '-s', '-w', str(os.getpid())])
     try:
-        capture = uuid.uuid4().hex
+        capture = session
         directory = Path('recordings')/capture
         directory.mkdir()
         active[0] = capture
@@ -396,6 +396,11 @@ def worker(config, session, state_dir):
             finish(mic)
             if mic and mic.stdout:
                 mic.stdout.close()
+            # A failed start can leave an empty directory; never remove media.
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
             active[0] = None
     finally:
         stop.set()

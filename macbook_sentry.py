@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+from queue import Full, Queue
 import re
 import shutil
 import signal
@@ -22,6 +23,7 @@ import time
 import apple_shortcuts
 import archive
 from controller import Controller
+from live import Viewer
 from presence_receiver import Receiver
 import state
 import telegram_bot
@@ -57,6 +59,13 @@ def load(path):
             all(isinstance(data.get(k), str) for k in phone_fields) and OWNER.fullmatch(data['phone_owner'])
             and HOST.fullmatch(data['phone_host']) and re.fullmatch(r'[0-9a-f]{64}', data['phone_secret'])):
         raise ValueError('Invalid phone configuration; rerun phone-setup')
+    if type(data.get('phone_public', False)) is not bool or data.get('phone_public') and not phone_fields.issubset(data):
+        raise ValueError('Invalid phone transport')
+    if {'live_owner', 'live_port'}.intersection(data) and not (
+            isinstance(data.get('live_owner'), str) and OWNER.fullmatch(data['live_owner'])
+            and type(data.get('live_port')) is int and 1024 <= data['live_port'] <= 65535
+            and data['live_port'] != data['listen_port']):
+        raise ValueError('Live view needs an owner and a separate loopback port')
     return data
 
 
@@ -119,8 +128,36 @@ class LocalServer(UnixStreamServer):
         pass
 
 
+def status_notifier(path, test):
+    if test:
+        return None
+    try:
+        binding = telegram_bot.validate_binding(state.read(path/'bot.json'))
+    except FileNotFoundError:
+        return None
+    notices = Queue(maxsize=4)
+
+    def deliver():
+        while True:
+            text = notices.get()
+            try:
+                telegram_bot.send(binding, text)
+            except (OSError, ValueError, RuntimeError):
+                print('Sentry status notice could not be delivered.', flush=True)
+
+    def enqueue(text):
+        try:
+            notices.put_nowait(text)
+        except Full:
+            return False
+        return True
+
+    threading.Thread(target=deliver, daemon=True).start()
+    return enqueue
+
+
 def serve(path, config, lock, test):
-    controller = Controller(config, lock, test=test)
+    controller = Controller(config, lock, test=test, notice=status_notifier(path, test))
     stopped = threading.Event()
 
     def dispatch(command):
@@ -162,8 +199,12 @@ def serve(path, config, lock, test):
             stack.callback(existing.unlink, missing_ok=True)
             if config.get('phone_owner'):
                 server = stack.enter_context(Receiver(config['listen_port'], config['phone_owner'],
-                                                       config['phone_secret'], controller))
+                                                       config['phone_secret'], controller,
+                                                       public_control=config.get('phone_public', False)))
                 listen(server)
+            if config.get('live_owner'):
+                viewer = stack.enter_context(Viewer(config['live_port'], config['live_owner'], controller, config))
+                listen(viewer)
             listen(local)
             print('Sentry running in', 'test' if test else 'unarmed', 'mode', flush=True)
             stopped.wait()
@@ -276,6 +317,11 @@ def main(argv=None):
     phone.add_argument('owner')
     phone.add_argument('--rotate', action='store_true')
     phone.add_argument('--listen-port', type=int, default=18765)
+    phone.add_argument('--via-funnel', action='store_true', help='Use public HTTPS for authenticated signals only')
+    live = commands.add_parser('live-setup')
+    live.add_argument('owner', help='Exact Tailscale login authorized to view')
+    live.add_argument('--listen-port', type=int, default=18766)
+    commands.add_parser('live-disable')
     commands.add_parser('shortcuts').add_argument('--diagnostic', action='store_true')
     args = parser.parse_args(argv)
     try:
@@ -342,17 +388,29 @@ def main(argv=None):
             elif args.command == 'phone-setup':
                 import secrets
                 if (not HOST.fullmatch(args.host) or not OWNER.fullmatch(args.owner)
-                        or not 1024 <= args.listen_port <= 65535):
-                    raise ValueError('Provide the Mac MagicDNS .ts.net name, exact Serve login, and a private origin port')
-                if args.rotate or not config.get('phone_secret'):
+                        or not 1024 <= args.listen_port <= 65535 or args.listen_port == config.get('live_port')):
+                    raise ValueError('Provide the Tailscale .ts.net name, exact Serve login, and a separate loopback port')
+                if (args.rotate or not config.get('phone_secret') or args.host != config.get('phone_host')
+                        or args.owner != config.get('phone_owner')
+                        or args.via_funnel != config.get('phone_public', False)):
                     config['phone_secret'] = secrets.token_hex(32)
-                config.update(phone_host=args.host, phone_owner=args.owner, listen_port=args.listen_port)
+                config.update(phone_host=args.host, phone_owner=args.owner, listen_port=args.listen_port,
+                              phone_public=args.via_funnel)
                 state.write(config_file, config)
-                print('Phone identity saved; no network routes changed')
+                print('Phone signal settings saved; no network routes changed')
             elif args.command == 'shortcuts':
                 if not config.get('phone_host'):
                     raise RuntimeError('Run phone-setup first')
                 print('Private signed pair:', apple_shortcuts.sign_pair(path, config, diagnostic=args.diagnostic))
+            elif args.command == 'live-setup':
+                if (not OWNER.fullmatch(args.owner) or not 1024 <= args.listen_port <= 65535
+                        or args.listen_port == config['listen_port']):
+                    raise ValueError('Provide the exact Tailscale login and a separate loopback port')
+                state.write(config_file, config | {'live_owner': args.owner, 'live_port': args.listen_port})
+                print('Private viewer configured; no network routes changed')
+            elif args.command == 'live-disable':
+                state.write(config_file, {k: v for k, v in config.items() if k not in ('live_owner', 'live_port')})
+                print('Viewer disabled; remove its Serve route if present')
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, ImportError, KeyError) as exc:
         print('Sentry:', message(exc), file=sys.stderr)

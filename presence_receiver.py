@@ -16,15 +16,13 @@ def diagnostic_secret(secret):
     return digest(secret.encode(), b'sentry-diagnostic-only-v1', 'sha256').hex()
 
 
-class Receiver(ThreadingHTTPServer):
+class BoundedServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 16
 
-    def __init__(self, port, owner, secret, controller):
-        self.owner, self.controller = owner, controller
-        self.secrets = (secret, diagnostic_secret(secret)) if controller.test else (secret,)
+    def __init__(self, port, handler):
         self.slots = threading.BoundedSemaphore(16)
-        super().__init__(('127.0.0.1', port), Handler)
+        super().__init__(('127.0.0.1', port), handler)
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
@@ -43,6 +41,13 @@ class Receiver(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         pass  # No request metadata or tracebacks in logs.
+
+
+class Receiver(BoundedServer):
+    def __init__(self, port, owner, secret, controller, *, public_control=False):
+        self.owner, self.controller, self.public_control = owner, controller, public_control
+        self.secrets = (secret, diagnostic_secret(secret)) if controller.test else (secret,)
+        super().__init__(port, Handler)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -70,7 +75,8 @@ class Handler(BaseHTTPRequestHandler):
         # Serve removes client-supplied Tailscale identity headers. Loopback is a
         # trust boundary, not authentication; the install secret is also needed.
         headers = self.headers.get_all(HEADER, [])
-        if (self.headers.get_all('Tailscale-User-Login') != [self.receiver.owner] or len(headers) != 1
+        if (not self.receiver.public_control and self.headers.get_all('Tailscale-User-Login') != [self.receiver.owner]
+                or len(headers) != 1
                 or not any(compare_digest(headers[0].encode(), secret.encode()) for secret in self.receiver.secrets)):
             return self.reply(403, {'error': 'forbidden'})
         name = {f'{prefix}/{signal}': signal for prefix in ('', PREFIX)

@@ -63,7 +63,7 @@ sentry check-model
 2. 맥에서 `sentry pair-bot`을 실행하세요. **봇 소유자가** 터미널의 숨김 입력란에 토큰을 입력하고, 화면에 표시된 `@bot`의 개인 채팅에 일회용 `/start <code>`를 그대로 보냅니다. 토큰을 채팅, 명령줄, 로그 또는 소스 폴더에 넣지 마세요. 토큰과 연결된 채팅 한 곳은 소유자만 읽을 수 있는 `~/.macbook-sentry/bot.json`에 저장됩니다. 봇의 수신 메시지를 확인하는 작업은 연결할 때만 실행됩니다.
 3. `sentry test-bot`을 실행해 텍스트와 소리가 포함된 MP4 테스트 영상을 확인하세요. 카메라는 켜지지 않습니다. 영상이 재생되면 `sentry configure --detection on`으로 사람 감지를 켭니다. `sentry configure --detection off`로 끄면 영상·음성 녹화만 합니다.
 
-토큰을 바꾸려면 Sentry를 중지하고 BotFather에서 기존 토큰을 취소한 뒤 새 토큰을 발급받으세요. `pair-bot`과 `test-bot`을 다시 실행하고 감시를 끈 상태로 시작합니다. 봇이나 수신 채팅을 바꿔도 이전 전송 대기열은 새 채팅으로 넘어가지 않습니다. 로컬 보관 기간 설정은 이미 텔레그램으로 보낸 클립에 적용되지 않습니다.
+토큰을 바꾸려면 Sentry를 중지하고 BotFather에서 기존 토큰을 취소한 뒤 새 토큰을 발급받으세요. `pair-bot`과 `test-bot`을 다시 실행하고 감시를 끈 상태로 시작합니다. 봇이나 수신 채팅을 바꿔도 이전 전송 대기열은 새 채팅으로 넘어가지 않습니다. 연결된 봇은 외출로 Sentry가 켜지면 `Sentry activated`, 귀가로 녹화 작업이 종료되면 `Sentry disabled`를 보냅니다. 켜짐 알림은 영상 저장 완료를 뜻하지 않습니다. 로컬 보관 기간 설정은 이미 텔레그램으로 보낸 클립에 적용되지 않습니다.
 
 ## 3. 아이폰 외출·귀가 자동화
 
@@ -75,16 +75,32 @@ sentry check-model
    tailscale serve --https=8443 --set-path=/sentry-presence http://127.0.0.1:18765
    ```
 
-   수신기는 `127.0.0.1`에서만 대기합니다. Funnel이나 공개 경로를 사용하지 마세요. 로컬 포트 `18765`가 이미 쓰이는 경우 `phone-setup ... --listen-port PORT`로 빈 포트를 지정하고 Serve의 대상 포트도 맞춥니다. Serve에 의도한 경로가 추가됐는지, Funnel이 8443에서 열려 있지 않은지 확인하세요. 종료하려면 Serve 탭에서 Ctrl-C를 누르고 `tailscale serve status`를 확인합니다. 정확히 Sentry 경로만 남아 있을 때에만 `tailscale serve --https=8443 --set-path=/sentry-presence off`로 제거하세요. 다른 경로를 초기화하지 않습니다.
-3. Sentry를 중지한 상태에서 `sentry shortcuts`와 `sentry shortcuts --diagnostic`을 실행합니다. 맥이 **Sentry Away**, **Sentry Home**과 별도 폴더의 **Test** 버전에 서명합니다. Apple의 `shortcuts sign`은 서명 중 Apple에 접속해 비공개 수신 주소와 신호 키가 포함된 단축어 내용을 보낼 수 있습니다. 봇 토큰이나 좌표는 단축어에 들어가지 않습니다. 가져오기는 누구나 할 수 있어도 신호를 보내려면 같은 소유자 계정과 설치별 키가 모두 필요하니, 파일은 AirDrop 등으로 내 아이폰에만 옮겨 파일을 열고 **단축어 추가**를 누르세요. 파일이 노출되면 `phone-setup ... --rotate`로 키를 바꿔 단축어를 다시 생성합니다. 교체할 때는 기존 자동화를 먼저 꺼두세요. 단축어는 전송 전에 실행 시각을 기록합니다. 테스트 단축어의 별도 키는 실제 운영 모드에서 거부됩니다.
+   수신기는 `127.0.0.1`에서만 대기합니다. `18765`가 이미 쓰이면 `phone-setup ... --listen-port PORT`로 빈 포트를 지정하고 프록시의 대상 포트도 맞추세요. Serve에 의도한 경로가 추가됐는지, Funnel이 8443에서 열려 있지 않은지 확인하세요. 종료하려면 Serve 탭에서 Ctrl-C를 누르고 `tailscale serve status`를 확인합니다. 정확히 Sentry 경로만 남아 있을 때만 `tailscale serve --https=8443 --set-path=/sentry-presence off`로 제거하세요. 다른 경로는 초기화하지 않습니다.
+3. Sentry를 중지하고 `sentry shortcuts`와 `sentry shortcuts --diagnostic`을 실행합니다. 맥은 키를 넣지 않은 외출·귀가 단축어에 서명합니다. 출력 폴더에는 `.shortcut` 파일 두 개와 소유자만 읽을 수 있는 `Sentry Setup Key.txt`가 따로 있습니다. 두 단축어를 가져올 때 각각 설정 키를 넣으세요. 입력 창이 없으면 첫 번째 텍스트 동작의 `PASTE_SETUP_KEY`를 바꿉니다. 키를 공유하거나 URL에 넣지 마세요. 테스트 파일에는 실제 운영에서 거부되는 별도 키를 사용합니다. 기존 설정을 업데이트할 때 집 위치와 외출·귀가 조건은 그대로 두고 실행할 단축어만 바꾸세요. 키가 노출되면 현재 연결 방식에 맞춰 `phone-setup ... --rotate`로 키를 바꾼 뒤 아이폰에 새 키를 넣으세요. 단축어는 전송 전에 실행 시각을 기록합니다.
 4. 다른 터미널 탭에서 `sentry run --test`를 실행하세요. 이 모드에서는 녹화가 시작되지 않고 영상도 삭제되지 않습니다. 아이폰에서 **Sentry Away Test**를 누르고 `accepted: true`, `event: away`, `mode: test`가 나오는지 확인합니다. 맥의 `sentry status`에서도 `last_accepted.away`가 갱신돼야 합니다. 다음으로 **Sentry Home Test**를 따로 실행해 `last_accepted.home`이 갱신되는지 확인하세요. iOS가 연결을 묻는다면 허용합니다. 403이면 Tailscale 계정과 신호 키를 확인하세요. 시각이 맞지 않거나 중복 신호라면 두 기기의 시간을 맞춘 뒤 새로 한 번 실행하세요.
 5. 아이폰 **단축어 → 자동화 → + → 떠날 때(Leave)**에서 집 위치를 정하고 **즉시 실행(Run Immediately)**과 **Sentry Away**를 선택합니다. **도착할 때(Arrive)**에는 **Sentry Home**을 연결하세요. 원한다면 집 Wi-Fi에 연결될 때도 **Sentry Home**을 실행할 수 있습니다. 자동화에는 결과 창이 뜨지 않는 일반 버전을 쓰고, **Test** 버전은 넣지 않습니다. 테스트 모드를 켠 채 아이폰이 잠긴 상태에서 외출과 귀가를 따로 확인하세요. 집 Wi-Fi 밖에서 셀룰러로 신호가 도착하는지, Wi-Fi 자동화도 설정했다면 해당 트리거가 따로 동작하는지 확인합니다. 자동화가 동작하지 않으면 맥의 수동 조작을 사용하세요. 네트워크가 끊겼다는 이유만으로 외출로 판단하지 않습니다. 마치면 `sentry stop`을 실행합니다.
 
-### 외부 접속 범위 확인
+### 아이폰에서 Tailscale을 끄고 외출·귀가 자동화 쓰기
 
-이 버전은 라이브 영상을 제공하지 않습니다. 외출·귀가 수신기는 루프백에만 두고 비공개 Tailscale Serve 포트를 사용하세요. `tailscale serve status`와 `tailscale funnel status`로 신호 경로가 공개되지 않았는지 확인합니다. Tailscale에 연결하지 않은 기기에서는 신호 주소에 접속되지 않아야 합니다. 라우터에서 카메라나 Sentry 포트를 포워딩하거나 Docker에서 호스트에 해당 포트를 공개하지 마세요.
+맥에서는 Tailscale을 계속 실행합니다. 이 방식을 원하면 위 2단계 대신 아래 명령을 사용하세요. 설치 에이전트는 HTTPS 443이 비어 있는지 확인한 뒤 전용 Funnel 경로를 포그라운드에서 실행합니다. 이 포트에 시청 페이지를 올리지 마세요. 기존 방식에서 전환할 때는 이전 신호 경로만 제거하고 단축어를 다시 생성하세요. 전송 방식을 바꾸면 키도 바뀝니다.
 
-별도로 라이브 시청 기능을 운영한다면, 전용 HTTPS 포트에서 비공개 Serve를 사용하세요. 시청 기기에 Tailscale에 로그인하고 접속 권한을 부여해야 합니다. 영상 페이지뿐 아니라 페이지가 불러오는 영상 파일도 같은 방식으로 보호하세요. 추측하기 어려운 공개 링크만으로 카메라 영상을 보호하지 마세요.
+```sh
+sentry phone-setup "$MAC_MAGICDNS_NAME" "$TAILSCALE_OWNER_LOGIN" --via-funnel
+tailscale funnel --https=443 --set-path=/sentry-presence http://127.0.0.1:18765
+```
+
+공개 주소만으로는 녹화를 시작하거나 멈출 수 없습니다. 수신기는 별도 설정 키를 요구하며, 오래됐거나 다시 보낸 신호는 거부합니다. 키까지 복사되면 다른 기기에서도 제어할 수 있습니다. 감시를 켜기 전에 아이폰에서 Tailscale을 끄고 셀룰러로 두 테스트 단축어를 확인하세요. 끄려면 전용 Funnel 명령을 종료하고 경로가 사라졌는지 확인합니다. 정확히 해당 경로만 남아 있을 때 `tailscale funnel --https=443 --set-path=/sentry-presence off`로 제거합니다.
+
+### Safari에서 비공개 라이브 시청
+
+Sentry를 중지하고 HTTPS 8444가 비어 있는지 확인한 뒤, Serve는 별도 터미널에서 실행하세요. 시청 서버는 설정 전까지 꺼져 있으며 공개 경로를 만들지 않습니다.
+
+```sh
+sentry live-setup "$TAILSCALE_OWNER_LOGIN"
+tailscale serve --https=8444 --set-path=/sentry-live http://127.0.0.1:18766/sentry-live
+```
+
+Sentry를 실행한 뒤 지정한 계정으로 Tailscale에 연결하고 Safari에서 `https://<mac-magicdns-name>:8444/sentry-live/`를 여세요. 10초 단위로 저장된 영상이 재생되므로 약간 지연됩니다. 외출 녹화 중인 최근 영상만 제공하며 귀가하면 전송을 멈춥니다. 과거 영상 목록은 제공하지 않습니다. `tailscale serve status`와 `tailscale funnel status`에서 시청 경로가 Serve에만 있는지 확인하세요. 포트 포워딩이나 공개 시청 링크는 사용하지 마세요. 끄려면 Sentry를 중지하고 `sentry live-disable`을 실행한 다음 전용 Serve 명령을 종료하거나 `/sentry-live` 경로만 제거합니다. 내장 시청 서버는 맥에서 실행됩니다. 별도 Docker 게이트웨이를 쓴다면 인증된 비공개 연결이 필요하며, 녹화 저장소를 공개하거나 컨테이너에 연결하지 않습니다.
 
 ## 4. 실제 기기 확인과 유지보수
 

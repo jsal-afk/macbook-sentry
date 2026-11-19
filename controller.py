@@ -32,8 +32,10 @@ def iso(epoch):
 
 
 class Controller:
-    def __init__(self, config, lock=None, *, test=False):
+    def __init__(self, config, lock=None, *, test=False, notice=None):
         self.config, self.lock, self.test = config, lock, test
+        self.notice = None if test else notice
+        self.last_notice = None
         self.cv = threading.Condition()
         self.armed = False
         self.presence = None
@@ -41,6 +43,7 @@ class Controller:
         self.last = {}
         self.away_until = self.away_wall_until = 0
         self.worker = None
+        self.session = None
         self.stop_by = None
         self.error = None
         self.closed = False
@@ -59,6 +62,14 @@ class Controller:
                     'stopping_capture': self.stop_by is not None, 'error': self.error,
                     'lease_until': iso(self.away_wall_until) if self.away_wall_until else None,
                     'last_accepted': {name: iso(at) for name, at in self.last.items()}}
+
+    def viewing_session(self):
+        with self.cv:
+            if (not self.test and self.armed and self.presence == 'away' and self.stop_by is None
+                    and self.worker is not None and self.worker.poll() is None
+                    and time.monotonic() < self.away_until and time.time() < self.away_wall_until):
+                return self.session
+            return None
 
     def arm(self):
         with self.cv:
@@ -127,6 +138,7 @@ class Controller:
                     self.armed = False
                     self.disarm(None, now)
                 self.worker = self.stop_by = None
+                self.session = None
             elif self.stop_by is not None:
                 if now >= self.stop_by:
                     self.kill_group(signal.SIGKILL)
@@ -143,12 +155,25 @@ class Controller:
                 raise OSError('Capture requires the service lock')
             payload = json.dumps(self.config | {'lease_wall': self.away_wall_until,
                                                 'lease_mono': self.away_until}).encode() + b'\n'
+            self.session = uuid.uuid4().hex
             self.worker = subprocess.Popen(
-                [sys.executable, '-B', str(ROOT/'sentry.py'), '--worker', uuid.uuid4().hex],
+                [sys.executable, '-B', str(ROOT/'sentry.py'), '--worker', self.session],
                 stdin=subprocess.PIPE, start_new_session=True, pass_fds=(self.lock.fileno(),))
             assert self.worker.stdin is not None
             self.worker.stdin.write(payload)
             self.worker.stdin.flush()
+
+    def notify_presence(self):
+        if self.notice is None:
+            return
+        text = None
+        if self.presence == 'home' and self.worker is None:
+            text = 'Sentry disabled'
+        elif self.presence == 'away' and self.worker is not None and self.stop_by is None:
+            if self.worker.poll() is None:
+                text = 'Sentry activated'
+        if text and text != self.last_notice and self.notice(text):
+            self.last_notice = text
 
     def run(self):
         with self.cv:
@@ -162,6 +187,7 @@ class Controller:
                     self.disarm(None, now)
                 if self.closed and self.worker is None:
                     return
+                self.notify_presence()
                 self.cv.wait(.2 if self.worker or not self.test and self.presence == 'away' else None)
 
     def retain(self):

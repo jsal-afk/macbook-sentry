@@ -24,6 +24,7 @@ import apple_shortcuts as shortcuts
 import archive
 import controller
 import macbook_sentry as cli
+from live import Viewer
 from person_detector import PersonGate
 from presence_receiver import Receiver, diagnostic_secret
 import sentry
@@ -76,6 +77,77 @@ class Candidate(unittest.TestCase):
         self.addCleanup(with_prefix.cleanup)
         self.base = Path(with_prefix.name).resolve()
 
+    def test_private_viewer_cannot_read_history_and_closes_on_home(self):
+        with patch.dict(os.environ, HOME=str(self.base)), cwd(self.base):
+            state.directory(create=True)
+            cfg = archive.provision_internal()
+            session = 'a'*32
+            capture = state.directory()/cfg['archive_name']/'recordings'/session
+            capture.mkdir()
+            name = '1900000000.ts'
+            media = capture/name
+            subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=15',
+                            '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '2',
+                            '-c:v', 'libx264', '-c:a', 'aac', '-f', 'mpegts', str(media)], check=True)
+            (capture/'segments.csv').write_text(f'{name},0,2\n')
+            lease: list[str | None] = [session]
+            class Current:
+                def viewing_session(self): return lease[0]
+            with Viewer(0, OWNER, Current(), cfg) as server:
+                self.assertEqual(server.server_address[0], '127.0.0.1')
+                t = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .02})
+                t.start()
+                root = '/sentry-live/'
+                segment = f'{root}{session}/{name}'
+                def fetch(path, owner=None):
+                    conn = HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+                    try:
+                        conn.request('GET', path, headers={'Tailscale-User-Login':owner} if owner else {})
+                        reply = conn.getresponse()
+                        return reply.status, reply.read(), reply.getheader('Cache-Control')
+                    finally:
+                        conn.close()
+                try:
+                    for path in (root,root+'index.m3u8',segment):
+                        self.assertEqual(fetch(path)[0], 403)
+                        self.assertEqual(fetch(path,'other@example.invalid')[0], 403)
+                    status, playlist, cache = fetch(root+'index.m3u8',OWNER)
+                    self.assertEqual((status,cache),(200,'private, no-store'))
+                    self.assertIn(f'./{session}/{name}'.encode(),playlist)
+                    status, data, _ = fetch(segment,OWNER)
+                    self.assertEqual((status,data),(200,media.read_bytes()))
+                    self.assertEqual(fetch(segment.replace(session, 'b'*32),OWNER)[0],404)
+                    self.assertEqual(fetch(root+'../config.json',OWNER)[0],404)
+                    self.assertEqual(fetch(root+'away',OWNER)[0],404)
+                    out = subprocess.check_output(['ffprobe', '-v', 'error', '-analyzeduration', '1000000', '-probesize', '100000', '-headers',
+                                  f'Tailscale-User-Login: {OWNER}\r\n', '-show_entries', 'stream=codec_type',
+                                  '-of', 'json', f'http://127.0.0.1:{server.server_port}{root}index.m3u8'], timeout=12)
+                    self.assertEqual({s['codec_type'] for s in json.loads(out)['streams']},{'audio','video'})
+                    lease[0] = None
+                    self.assertEqual(fetch(root+'index.m3u8',OWNER)[0],410)
+                    self.assertEqual(fetch(segment,OWNER)[0],410)
+                finally:
+                    server.shutdown(); t.join()
+
+    def test_public_signal_lane_requires_key_and_rejects_replay(self):
+        test = controller.Controller({}, test=True)
+        with Receiver(0, OWNER, SECRET, test, public_control=True) as receiver:
+            thread = threading.Thread(target=receiver.serve_forever, kwargs={'poll_interval': .02})
+            thread.start()
+            try:
+                headers = {'Content-Type': 'application/json'}
+                for event in ('away','home'):
+                    path = '/sentry-presence/'+event
+                    data = {'event_at': controller.iso(time.time())}
+                    self.assertEqual(post(receiver.server_port,path,headers,data)[0],403)
+                    self.assertEqual(post(receiver.server_port,path,headers | {'X-Sentry-Signal':'wrong'},data)[0],403)
+                    auth = headers | {'X-Sentry-Signal':diagnostic_secret(SECRET)}
+                    self.assertEqual(post(receiver.server_port,path,auth,data)[0],200)
+                    self.assertEqual(post(receiver.server_port,path,auth,data)[0],409)
+                self.assertFalse(test.status()['capture_worker'])
+            finally:
+                receiver.shutdown(); thread.join(); test.close()
+
     def test_receiver_bounds_concurrent_connections_and_recovers(self):
         test = controller.Controller({}, test=True)
         sockets = []
@@ -110,6 +182,31 @@ class Candidate(unittest.TestCase):
                 thread.join()
                 test.close()
 
+    def test_status_notices_follow_worker_state_and_deduplicate(self):
+        from unittest.mock import Mock
+        service = controller.Controller({}, test=True)
+        sent = []
+        try:
+            with service.cv:
+                service.notice = lambda text: not sent.append(text)
+                service.presence = 'away'
+                service.notify_presence()
+                self.assertEqual(sent, [])
+                service.worker = Mock()
+                service.worker.poll.return_value = None
+                service.notify_presence()
+                service.notify_presence()
+                service.presence = 'home'
+                service.notify_presence()
+                self.assertEqual(sent, ['Sentry activated'])
+                service.worker = None
+                service.notify_presence()
+                service.notify_presence()
+                self.assertEqual(sent, ['Sentry activated', 'Sentry disabled'])
+        finally:
+            service.worker = None
+            service.close()
+
     def test_shortcut_serialization_and_replay_on_test_receiver(self):
         test = controller.Controller({}, test=True)
         with Receiver(0, OWNER, SECRET, test) as receiver:
@@ -122,8 +219,12 @@ class Candidate(unittest.TestCase):
                     date, request, result = actions
                     self.assertTrue(date['WFWorkflowActionIdentifier'].endswith('format.date'))
                     date_params = date['WFWorkflowActionParameters']
-                    self.assertEqual(date_params['WFDate']['Value']['Type'], 'CurrentDate')
-                    self.assertIn('.SSS', date_params['WFDateFormatString'])
+                    self.assertEqual(date_params['WFDate'], {
+                        'WFSerializationType': 'WFTextTokenString',
+                        'Value': {'string': '\ufffc', 'attachmentsByRange': {'{0, 1}': {'Type': 'CurrentDate'}}},
+                    })
+                    self.assertEqual(date_params['WFDateFormatStyle'], 'ISO 8601')
+                    self.assertIs(date_params['WFISO8601IncludeTime'], True)
                     params = request['WFWorkflowActionParameters']
                     self.assertEqual((params['WFHTTPMethod'], params['WFHTTPBodyType']), ('POST', 'JSON'))
                     def unpack(key):
@@ -189,8 +290,16 @@ time.sleep(35)
                 self.assertEqual(service.away_until, lease)
                 self.assertIsNone(service.receive('home', time.time()))
                 until(lambda: launch.poll() is not None and service.worker is None)
-                with self.assertRaises(ConnectionRefusedError):
-                    socket.create_connection(('127.0.0.1', port), timeout=1)
+                def listener_closed():
+                    try:
+                        with socket.create_connection(('127.0.0.1', port), timeout=1):
+                            return False
+                    except ConnectionResetError:
+                        # Darwin can reset a connection that raced group shutdown.
+                        return False
+                    except ConnectionRefusedError:
+                        return True
+                until(listener_closed, seconds=2)
                 self.assertIsNone(service.receive('away', time.time()))
                 until(lambda: service.worker)
                 until(lambda: service.status()['error'] == 'away_lease_expired' and service.worker is None)
@@ -441,9 +550,19 @@ time.sleep(35)
             with self.assertRaises(OSError):
                 state.read(link)
             self.assertEqual(cli.main(['phone-setup', HOST, OWNER]), 0)
+            cfg = cli.load(path)
+            first_key = cfg['phone_secret']
+            self.assertEqual(cli.main(['phone-setup', HOST, OWNER, '--via-funnel']), 0)
+            cfg = cli.load(path)
+            self.assertNotEqual(cfg['phone_secret'], first_key)
             def fake_sign(args, **kw):
                 self.assertEqual(args[:4], ['/usr/bin/shortcuts', 'sign', '--mode', 'anyone'])
-                value = plistlib.loads(Path(args[5]).read_bytes())
+                raw = Path(args[5]).read_bytes()
+                value = plistlib.loads(raw)
+                self.assertNotIn(cfg['phone_secret'].encode(),raw)
+                self.assertNotIn(diagnostic_secret(cfg['phone_secret']).encode(),raw)
+                self.assertEqual(value['WFWorkflowActions'][0]['WFWorkflowActionParameters']['WFTextActionText'],'PASTE_SETUP_KEY')
+                self.assertIsNone(urlsplit(value['WFWorkflowActions'][2]['WFWorkflowActionParameters']['WFURL']['Value']['string']).port)
                 self.assertGreaterEqual(len(value['WFWorkflowActions']), 2)
                 Path(args[7]).write_bytes(b'test signer output')
             with patch.object(shortcuts.subprocess, 'run', side_effect=fake_sign):
@@ -451,6 +570,9 @@ time.sleep(35)
                 self.assertEqual(cli.main(['shortcuts', '--diagnostic']), 0)
             self.assertEqual(sorted(p.name for p in path.glob('phone-*/*.shortcut')),
                              ['Sentry Away Test.shortcut', 'Sentry Away.shortcut', 'Sentry Home Test.shortcut', 'Sentry Home.shortcut'])
+            keys = [p for p in path.glob('phone-*/Sentry Setup Key.txt')]
+            self.assertEqual({p.read_text().strip() for p in keys},{cfg['phone_secret'],diagnostic_secret(cfg['phone_secret'])})
+            self.assertTrue(all(p.stat().st_mode & 0o777 == 0o600 for p in keys))
             def delivery(token, method, fields, *, video):
                 self.assertEqual(token, rotated['token'])
                 self.assertEqual(fields['chat_id'], 22)
